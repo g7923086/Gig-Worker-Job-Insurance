@@ -186,3 +186,95 @@
     (as-contract (stx-transfer? available tx-sender contract-owner))
   )
 )
+
+
+(define-constant discount-threshold-1 u2)
+(define-constant discount-threshold-2 u4)
+(define-constant discount-rate-1 u5)
+(define-constant discount-rate-2 u10)
+
+(define-read-only (get-user-active-policies-count (user principal))
+  (let (
+    (policy-list (get policy-ids (get-user-policies user)))
+    (active-count (fold check-active-policy policy-list u0))
+  )
+    active-count
+  )
+)
+
+(define-private (check-active-policy (policy-id uint) (count uint))
+  (if (is-policy-active policy-id)
+    (+ count u1)
+    count
+  )
+)
+
+(define-read-only (calculate-discounted-premium (premium-amount uint) (user principal))
+  (let (
+    (active-count (get-user-active-policies-count user))
+    (discount-rate (if (>= active-count discount-threshold-2)
+      discount-rate-2
+      (if (>= active-count discount-threshold-1)
+        discount-rate-1
+        u0
+      )
+    ))
+  )
+    (- premium-amount (/ (* premium-amount discount-rate) u100))
+  )
+)
+
+
+(define-public (get-discounted-premium (premium-amount uint) (user principal))
+  (let (
+    (discounted-premium (calculate-discounted-premium premium-amount user))
+  )
+    (ok discounted-premium)
+  )
+)
+(define-public (get-coverage-amount (premium-amount uint) (period-type uint))
+  (let (
+    (coverage-amount (calculate-coverage premium-amount period-type))
+  )
+    (ok coverage-amount)
+  )
+)
+(define-public (get-claimable-amount (policy-id uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+  )
+    (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+    (asserts! (get active policy) err-not-active)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (< stacks-block-height (get end-block policy)) err-policy-expired)
+    
+    (ok (get coverage-amount policy))
+  )
+)(define-constant err-cannot-extend (err u111))
+(define-constant extension-window u10)
+
+(define-public (extend-policy (policy-id uint) (additional-premium uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (current-end-block (get end-block policy))
+    (period-blocks (if (is-eq (get period-type policy) daily-period) u144 (* u144 u7)))
+  )
+    (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+    (asserts! (get active policy) err-not-active)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (>= (+ current-end-block extension-window) stacks-block-height) err-cannot-extend)
+    (asserts! (>= additional-premium (var-get min-premium-amount)) err-invalid-amount)
+    (asserts! (is-ok (stx-transfer? additional-premium tx-sender (as-contract tx-sender))) err-insufficient-funds)
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { 
+        end-block: (+ current-end-block period-blocks),
+        premium-amount: (+ (get premium-amount policy) additional-premium)
+      })
+    )
+    
+    (var-set total-premiums (+ (var-get total-premiums) additional-premium))
+    (ok true)
+  )
+)
