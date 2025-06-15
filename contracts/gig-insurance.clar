@@ -19,6 +19,24 @@
 (define-data-var total-premiums uint u0)
 (define-data-var total-claims uint u0)
 
+
+(define-constant err-beneficiary-exists (err u112))
+(define-constant err-beneficiary-not-found (err u113))
+(define-constant err-max-beneficiaries (err u114))
+(define-constant err-not-beneficiary (err u115))
+(define-constant max-beneficiaries u5)
+(define-constant beneficiary-claim-delay u144)
+
+(define-map policy-beneficiaries
+  { policy-id: uint }
+  { beneficiaries: (list 5 principal) }
+)
+
+(define-map beneficiary-shares
+  { policy-id: uint, beneficiary: principal }
+  { share-percentage: uint }
+)
+
 (define-map policies
   { policy-id: uint }
   {
@@ -210,17 +228,19 @@
 )
 
 (define-read-only (calculate-discounted-premium (premium-amount uint) (user principal))
-  (let (
-    (active-count (get-user-active-policies-count user))
-    (discount-rate (if (>= active-count discount-threshold-2)
-      discount-rate-2
-      (if (>= active-count discount-threshold-1)
-        discount-rate-1
-        u0
-      )
-    ))
-  )
-    (- premium-amount (/ (* premium-amount discount-rate) u100))
+  (begin
+    (let (
+      (active-count (get-user-active-policies-count user))
+      (discount-rate (if (>= active-count discount-threshold-2)
+        discount-rate-2
+        (if (>= active-count discount-threshold-1)
+          discount-rate-1
+          u0
+        )
+      ))
+    )
+      (- premium-amount (/ (* premium-amount discount-rate) u100))
+    )
   )
 )
 
@@ -275,6 +295,120 @@
     )
     
     (var-set total-premiums (+ (var-get total-premiums) additional-premium))
+    (ok true)
+  )
+)
+
+
+
+(define-read-only (get-policy-beneficiaries (policy-id uint))
+  (default-to { beneficiaries: (list) } (map-get? policy-beneficiaries { policy-id: policy-id }))
+)
+
+(define-read-only (get-beneficiary-share (policy-id uint) (beneficiary principal))
+  (default-to { share-percentage: u0 } (map-get? beneficiary-shares { policy-id: policy-id, beneficiary: beneficiary }))
+)
+
+(define-read-only (calculate-beneficiary-payout (policy-id uint) (beneficiary principal))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (let (
+      (coverage (get coverage-amount policy))
+      (share (get share-percentage (get-beneficiary-share policy-id beneficiary)))
+    )
+      (/ (* coverage share) u100)
+    )
+    u0
+  )
+)
+
+(define-public (add-beneficiary (policy-id uint) (beneficiary principal) (share-percentage uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (current-beneficiaries (get beneficiaries (get-policy-beneficiaries policy-id)))
+  )
+    (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+    (asserts! (get active policy) err-not-active)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (< (len current-beneficiaries) max-beneficiaries) err-max-beneficiaries)
+    (asserts! (is-none (index-of current-beneficiaries beneficiary)) err-beneficiary-exists)
+    (asserts! (and (> share-percentage u0) (<= share-percentage u100)) err-invalid-amount)
+    
+    (map-set policy-beneficiaries
+      { policy-id: policy-id }
+      { beneficiaries: (unwrap! (as-max-len? (append current-beneficiaries beneficiary) u5) err-max-beneficiaries) }
+    )
+    
+    (map-set beneficiary-shares
+      { policy-id: policy-id, beneficiary: beneficiary }
+      { share-percentage: share-percentage }
+    )
+    
+    (ok true)
+  )
+)
+
+;; (define-public (remove-beneficiary (policy-id uint) (beneficiary principal))
+;;   (let (
+;;     (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+;;     (current-beneficiaries (get beneficiaries (get-policy-beneficiaries policy-id)))
+;;     ;; (filtered-beneficiaries (unwrap! (as-max-len? (filter not (map (lambda (b) (is-eq b beneficiary)) current-beneficiaries)) u5) err-max-beneficiaries))
+;;   )
+;;     (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+;;     (asserts! (get active policy) err-not-active)
+;;     (asserts! (not (get claimed policy)) err-already-claimed)
+;;     (asserts! (is-some (index-of current-beneficiaries beneficiary)) err-beneficiary-not-found)
+    
+;;     (map-set policy-beneficiaries
+;;       { policy-id: policy-id }
+;;       { beneficiaries: (unwrap! (as-max-len? (filter (lambda (b) (not (is-eq b beneficiary))) current-beneficiaries) u5) err-max-beneficiaries) }
+;;     )
+    
+;;     (map-delete beneficiary-shares { policy-id: policy-id, beneficiary: beneficiary })
+    
+;;     (ok true)
+;;   )
+;; )
+
+(define-public (beneficiary-claim (policy-id uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (beneficiaries (get beneficiaries (get-policy-beneficiaries policy-id)))
+    (payout-amount (calculate-beneficiary-payout policy-id tx-sender))
+  )
+    (asserts! (is-some (index-of beneficiaries tx-sender)) err-not-beneficiary)
+    (asserts! (get active policy) err-not-active)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (< stacks-block-height (get end-block policy)) err-policy-expired)
+    (asserts! (>= stacks-block-height (+ (get start-block policy) beneficiary-claim-delay)) err-not-eligible)
+    (asserts! (> payout-amount u0) err-invalid-amount)
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { claimed: true })
+    )
+    
+    (var-set total-claims (+ (var-get total-claims) payout-amount))
+    
+    (as-contract (stx-transfer? payout-amount tx-sender tx-sender))
+  )
+)
+
+(define-public (update-beneficiary-share (policy-id uint) (beneficiary principal) (new-share uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (beneficiaries (get beneficiaries (get-policy-beneficiaries policy-id)))
+  )
+    (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+    (asserts! (get active policy) err-not-active)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (is-some (index-of beneficiaries beneficiary)) err-beneficiary-not-found)
+    (asserts! (and (> new-share u0) (<= new-share u100)) err-invalid-amount)
+    
+    (map-set beneficiary-shares
+      { policy-id: policy-id, beneficiary: beneficiary }
+      { share-percentage: new-share }
+    )
+    
     (ok true)
   )
 )
