@@ -684,3 +684,309 @@
     (initialize-risk-tiers)
   )
 )
+
+;; Emergency Claims Processing System
+;; Provides immediate partial payouts for verified emergencies
+
+(define-constant err-emergency-not-found (err u121))
+(define-constant err-emergency-cooldown (err u122))
+(define-constant err-invalid-emergency-type (err u123))
+(define-constant err-emergency-contact-required (err u124))
+(define-constant err-insufficient-emergency-reserves (err u125))
+(define-constant err-emergency-already-processed (err u126))
+(define-constant err-emergency-verification-failed (err u127))
+
+;; Emergency types
+(define-constant emergency-medical u1)
+(define-constant emergency-accident u2)
+(define-constant emergency-equipment-failure u3)
+(define-constant emergency-hospitalization u4)
+(define-constant emergency-vehicle-breakdown u5)
+
+;; Emergency system parameters
+(define-constant emergency-cooldown-blocks u720)
+(define-constant max-emergency-claims-per-policy u3)
+(define-constant emergency-verification-window u144)
+
+(define-data-var emergency-reserves-percentage uint u15)
+(define-data-var total-emergency-payouts uint u0)
+
+;; Emergency type configurations
+(define-map emergency-type-configs
+  { emergency-type: uint }
+  {
+    payout-percentage: uint,
+    min-verification-delay: uint,
+    requires-contact: bool,
+    max-amount-per-claim: uint,
+    active: bool
+  }
+)
+
+;; User emergency contacts
+(define-map emergency-contacts
+  { user: principal }
+  {
+    primary-contact: principal,
+    secondary-contact: principal,
+    last-updated: uint
+  }
+)
+
+;; Emergency claims tracking
+(define-map emergency-claims
+  { claim-id: uint }
+  {
+    policy-id: uint,
+    claimant: principal,
+    emergency-type: uint,
+    requested-amount: uint,
+    approved-amount: uint,
+    verification-contact: principal,
+    claim-block: uint,
+    verification-block: uint,
+    status: uint,
+    verification-data: (string-ascii 100)
+  }
+)
+
+;; User emergency history
+(define-map user-emergency-history
+  { user: principal }
+  {
+    total-emergency-claims: uint,
+    last-emergency-claim-block: uint,
+    total-emergency-payouts: uint
+  }
+)
+
+(define-data-var next-emergency-claim-id uint u1)
+
+;; Initialize emergency type configurations
+(define-private (initialize-emergency-types)
+  (begin
+    (map-set emergency-type-configs { emergency-type: emergency-medical }
+      { payout-percentage: u50, min-verification-delay: u72, requires-contact: true, max-amount-per-claim: u5000000, active: true })
+    (map-set emergency-type-configs { emergency-type: emergency-accident }
+      { payout-percentage: u60, min-verification-delay: u48, requires-contact: true, max-amount-per-claim: u7000000, active: true })
+    (map-set emergency-type-configs { emergency-type: emergency-equipment-failure }
+      { payout-percentage: u30, min-verification-delay: u24, requires-contact: false, max-amount-per-claim: u2000000, active: true })
+    (map-set emergency-type-configs { emergency-type: emergency-hospitalization }
+      { payout-percentage: u70, min-verification-delay: u96, requires-contact: true, max-amount-per-claim: u10000000, active: true })
+    (map-set emergency-type-configs { emergency-type: emergency-vehicle-breakdown }
+      { payout-percentage: u40, min-verification-delay: u12, requires-contact: false, max-amount-per-claim: u3000000, active: true })
+    (ok true)
+  )
+)
+
+;; Read-only functions
+(define-read-only (get-emergency-type-config (emergency-type uint))
+  (map-get? emergency-type-configs { emergency-type: emergency-type })
+)
+
+(define-read-only (get-emergency-contacts (user principal))
+  (map-get? emergency-contacts { user: user })
+)
+
+(define-read-only (get-emergency-claim (claim-id uint))
+  (map-get? emergency-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-user-emergency-history (user principal))
+  (default-to 
+    { total-emergency-claims: u0, last-emergency-claim-block: u0, total-emergency-payouts: u0 }
+    (map-get? user-emergency-history { user: user })
+  )
+)
+
+(define-read-only (calculate-emergency-payout (policy-id uint) (emergency-type uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy 
+    (match (get-emergency-type-config emergency-type)
+      config 
+      (let (
+        (coverage (get coverage-amount policy))
+        (payout-percentage (get payout-percentage config))
+        (max-amount (get max-amount-per-claim config))
+        (calculated-amount (/ (* coverage payout-percentage) u100))
+      )
+        (if (> calculated-amount max-amount) max-amount calculated-amount)
+      )
+      u0
+    )
+    u0
+  )
+)
+
+(define-read-only (get-available-emergency-reserves)
+  (let (
+    (total-premium-pool (var-get total-premiums))
+    (reserves-percentage (var-get emergency-reserves-percentage))
+    (total-payouts (var-get total-emergency-payouts))
+    (available-reserves (/ (* total-premium-pool reserves-percentage) u100))
+  )
+    (if (> available-reserves total-payouts) (- available-reserves total-payouts) u0)
+  )
+)
+
+;; Set emergency contacts
+(define-public (set-emergency-contacts (primary principal) (secondary principal))
+  (begin
+    (asserts! (not (is-eq primary secondary)) err-invalid-amount)
+    (asserts! (not (is-eq primary tx-sender)) err-invalid-amount)
+    (asserts! (not (is-eq secondary tx-sender)) err-invalid-amount)
+    
+    (map-set emergency-contacts
+      { user: tx-sender }
+      {
+        primary-contact: primary,
+        secondary-contact: secondary,
+        last-updated: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Submit emergency claim
+(define-public (submit-emergency-claim (policy-id uint) (emergency-type uint) (verification-data (string-ascii 100)))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (emergency-config (unwrap! (get-emergency-type-config emergency-type) err-invalid-emergency-type))
+    (user-history (get-user-emergency-history tx-sender))
+    (claim-id (var-get next-emergency-claim-id))
+    (payout-amount (calculate-emergency-payout policy-id emergency-type))
+    (available-reserves (get-available-emergency-reserves))
+  )
+    (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+    (asserts! (get active policy) err-not-active)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (get active emergency-config) err-invalid-emergency-type)
+    (asserts! (< (get total-emergency-claims user-history) max-emergency-claims-per-policy) err-emergency-already-processed)
+    (asserts! (>= (- stacks-block-height (get last-emergency-claim-block user-history)) emergency-cooldown-blocks) err-emergency-cooldown)
+    (asserts! (>= available-reserves payout-amount) err-insufficient-emergency-reserves)
+    
+    (if (get requires-contact emergency-config)
+      (asserts! (is-some (get-emergency-contacts tx-sender)) err-emergency-contact-required)
+      true
+    )
+    
+    (map-set emergency-claims
+      { claim-id: claim-id }
+      {
+        policy-id: policy-id,
+        claimant: tx-sender,
+        emergency-type: emergency-type,
+        requested-amount: payout-amount,
+        approved-amount: u0,
+        verification-contact: (match (get-emergency-contacts tx-sender) 
+                                contacts (get primary-contact contacts)
+                                tx-sender),
+        claim-block: stacks-block-height,
+        verification-block: u0,
+        status: u0,
+        verification-data: verification-data
+      }
+    )
+    
+    (map-set user-emergency-history
+      { user: tx-sender }
+      {
+        total-emergency-claims: (+ (get total-emergency-claims user-history) u1),
+        last-emergency-claim-block: stacks-block-height,
+        total-emergency-payouts: (get total-emergency-payouts user-history)
+      }
+    )
+    
+    (var-set next-emergency-claim-id (+ claim-id u1))
+    (ok claim-id)
+  )
+)
+
+;; Verify and approve emergency claim
+(define-public (verify-emergency-claim (claim-id uint))
+  (let (
+    (claim (unwrap! (get-emergency-claim claim-id) err-emergency-not-found))
+    (emergency-config (unwrap! (get-emergency-type-config (get emergency-type claim)) err-invalid-emergency-type))
+    (user-contacts (get-emergency-contacts (get claimant claim)))
+    (min-delay (get min-verification-delay emergency-config))
+    (payout-amount (get requested-amount claim))
+    (user-history (get-user-emergency-history (get claimant claim)))
+  )
+    (asserts! (is-eq (get status claim) u0) err-emergency-already-processed)
+    (asserts! (>= (- stacks-block-height (get claim-block claim)) min-delay) err-emergency-verification-failed)
+    (asserts! (< (- stacks-block-height (get claim-block claim)) emergency-verification-window) err-emergency-verification-failed)
+    
+    (if (get requires-contact emergency-config)
+      (match user-contacts
+        contacts (asserts! (or (is-eq tx-sender (get primary-contact contacts)) 
+                             (is-eq tx-sender (get secondary-contact contacts))
+                             (is-eq tx-sender contract-owner)) err-emergency-contact-required)
+        (asserts! (is-eq tx-sender contract-owner) err-emergency-contact-required)
+      )
+      true
+    )
+    
+    (map-set emergency-claims
+      { claim-id: claim-id }
+      (merge claim {
+        approved-amount: payout-amount,
+        verification-block: stacks-block-height,
+        status: u2
+      })
+    )
+    
+    (map-set user-emergency-history
+      { user: (get claimant claim) }
+      (merge user-history {
+        total-emergency-payouts: (+ (get total-emergency-payouts user-history) payout-amount)
+      })
+    )
+    
+    (var-set total-emergency-payouts (+ (var-get total-emergency-payouts) payout-amount))
+    
+    (as-contract (stx-transfer? payout-amount tx-sender (get claimant claim)))
+  )
+)
+
+;; Configure emergency type (admin only)
+(define-public (configure-emergency-type (emergency-type uint) (payout-percentage uint) (min-delay uint) (requires-contact bool) (max-amount uint) (active bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= payout-percentage u100) err-invalid-amount)
+    (asserts! (> max-amount u0) err-invalid-amount)
+    
+    (map-set emergency-type-configs
+      { emergency-type: emergency-type }
+      {
+        payout-percentage: payout-percentage,
+        min-verification-delay: min-delay,
+        requires-contact: requires-contact,
+        max-amount-per-claim: max-amount,
+        active: active
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Set emergency reserves percentage (admin only)
+(define-public (set-emergency-reserves-percentage (new-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-percentage u50) err-invalid-amount)
+    (var-set emergency-reserves-percentage new-percentage)
+    (ok true)
+  )
+)
+
+;; Initialize emergency system
+(define-public (initialize-emergency-system)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (initialize-emergency-types)
+  )
+)
+
+
+
