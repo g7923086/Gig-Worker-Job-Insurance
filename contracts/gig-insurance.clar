@@ -696,6 +696,69 @@
 (define-constant err-emergency-already-processed (err u126))
 (define-constant err-emergency-verification-failed (err u127))
 
+;; Appeal system error codes
+(define-constant err-not-appealable (err u128))
+(define-constant err-appeal-expired (err u129))
+(define-constant err-appeal-exists (err u130))
+(define-constant err-appeal-not-found (err u131))
+(define-constant err-already-voted (err u132))
+(define-constant err-appeal-not-ready (err u133))
+(define-constant err-insufficient-voting-power (err u134))
+
+;; Appeal system constants
+(define-constant appeal-window-blocks u1008) ;; 7 days
+(define-constant min-voting-power u1000000) ;; Minimum premium to vote
+(define-constant appeal-quorum u3) ;; Minimum number of votes needed
+
+;; Appeal statuses
+(define-constant appeal-status-pending u0)
+(define-constant appeal-status-approved u1)
+(define-constant appeal-status-rejected u2)
+(define-constant appeal-status-expired u3)
+
+;; Claim dispute states
+(define-map claim-disputes
+  { policy-id: uint }
+  {
+    claimant: principal,
+    dispute-reason: (string-ascii 200),
+    dispute-block: uint,
+    status: uint, ;; 0=pending, 1=under-review, 2=denied, 3=approved
+    reviewed-by: principal,
+    review-block: uint
+  }
+)
+
+;; Appeals tracking
+(define-map appeals
+  { appeal-id: uint }
+  {
+    policy-id: uint,
+    appellant: principal,
+    appeal-reason: (string-ascii 200),
+    submission-block: uint,
+    deadline-block: uint,
+    votes-for: uint,
+    votes-against: uint,
+    total-voting-power-for: uint,
+    total-voting-power-against: uint,
+    status: uint,
+    resolved-block: uint
+  }
+)
+
+;; Appeal votes tracking
+(define-map appeal-votes
+  { appeal-id: uint, voter: principal }
+  {
+    vote: bool, ;; true = for, false = against
+    voting-power: uint,
+    vote-block: uint
+  }
+)
+
+(define-data-var next-appeal-id uint u1)
+
 ;; Emergency types
 (define-constant emergency-medical u1)
 (define-constant emergency-accident u2)
@@ -986,6 +1049,257 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (initialize-emergency-types)
   )
+)
+
+;; === CLAIM DISPUTE AND APPEAL SYSTEM ===
+
+;; Submit a claim dispute (admin function)
+(define-public (dispute-claim (policy-id uint) (dispute-reason (string-ascii 200)))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active policy) err-not-active)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (is-none (map-get? claim-disputes { policy-id: policy-id })) err-already-exists)
+    
+    (map-set claim-disputes
+      { policy-id: policy-id }
+      {
+        claimant: (get owner policy),
+        dispute-reason: dispute-reason,
+        dispute-block: stacks-block-height,
+        status: u2, ;; denied
+        reviewed-by: tx-sender,
+        review-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Submit an appeal on a disputed claim
+(define-public (submit-appeal (policy-id uint) (appeal-reason (string-ascii 200)))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (dispute (unwrap! (map-get? claim-disputes { policy-id: policy-id }) err-not-found))
+    (appeal-id (var-get next-appeal-id))
+    (deadline (+ stacks-block-height appeal-window-blocks))
+  )
+    (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+    (asserts! (is-eq (get claimant dispute) tx-sender) err-owner-only)
+    (asserts! (is-eq (get status dispute) u2) err-not-appealable) ;; only denied claims can be appealed
+    (asserts! (<= (- stacks-block-height (get dispute-block dispute)) appeal-window-blocks) err-appeal-expired)
+    
+    (map-set appeals
+      { appeal-id: appeal-id }
+      {
+        policy-id: policy-id,
+        appellant: tx-sender,
+        appeal-reason: appeal-reason,
+        submission-block: stacks-block-height,
+        deadline-block: deadline,
+        votes-for: u0,
+        votes-against: u0,
+        total-voting-power-for: u0,
+        total-voting-power-against: u0,
+        status: appeal-status-pending,
+        resolved-block: u0
+      }
+    )
+    
+    (var-set next-appeal-id (+ appeal-id u1))
+    (ok appeal-id)
+  )
+)
+
+;; Calculate voting power based on user's total premium contributions
+(define-private (calculate-voting-power (voter principal))
+  (let (
+    (user-policy-list (get policy-ids (get-user-policies voter)))
+    (total-premium (fold sum-user-premiums user-policy-list u0))
+  )
+    (if (>= total-premium min-voting-power) total-premium u0)
+  )
+)
+
+;; Helper function to sum premiums
+(define-private (sum-user-premiums (policy-id uint) (total uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (+ total (get premium-amount policy))
+    total
+  )
+)
+
+;; Vote on an appeal
+(define-public (vote-on-appeal (appeal-id uint) (vote-for bool))
+  (let (
+    (appeal (unwrap! (map-get? appeals { appeal-id: appeal-id }) err-appeal-not-found))
+    (voting-power (calculate-voting-power tx-sender))
+  )
+    (asserts! (> voting-power u0) err-insufficient-voting-power)
+    (asserts! (is-eq (get status appeal) appeal-status-pending) err-appeal-not-ready)
+    (asserts! (< stacks-block-height (get deadline-block appeal)) err-appeal-expired)
+    (asserts! (is-none (map-get? appeal-votes { appeal-id: appeal-id, voter: tx-sender })) err-already-voted)
+    
+    ;; Record the vote
+    (map-set appeal-votes
+      { appeal-id: appeal-id, voter: tx-sender }
+      {
+        vote: vote-for,
+        voting-power: voting-power,
+        vote-block: stacks-block-height
+      }
+    )
+    
+    ;; Update appeal vote counts
+    (map-set appeals
+      { appeal-id: appeal-id }
+      (merge appeal {
+        votes-for: (if vote-for (+ (get votes-for appeal) u1) (get votes-for appeal)),
+        votes-against: (if vote-for (get votes-against appeal) (+ (get votes-against appeal) u1)),
+        total-voting-power-for: (if vote-for 
+                                  (+ (get total-voting-power-for appeal) voting-power) 
+                                  (get total-voting-power-for appeal)),
+        total-voting-power-against: (if vote-for 
+                                      (get total-voting-power-against appeal)
+                                      (+ (get total-voting-power-against appeal) voting-power))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Process appeal after voting deadline
+(define-public (process-appeal (appeal-id uint))
+  (let (
+    (appeal (unwrap! (map-get? appeals { appeal-id: appeal-id }) err-appeal-not-found))
+    (total-votes (+ (get votes-for appeal) (get votes-against appeal)))
+    (votes-for (get votes-for appeal))
+    (voting-power-for (get total-voting-power-for appeal))
+    (voting-power-against (get total-voting-power-against appeal))
+    (total-voting-power (+ voting-power-for voting-power-against))
+  )
+    (asserts! (is-eq (get status appeal) appeal-status-pending) err-appeal-not-ready)
+    (asserts! (>= stacks-block-height (get deadline-block appeal)) err-appeal-not-ready)
+    
+    (let (
+      (appeal-approved (and 
+                        (>= total-votes appeal-quorum)
+                        (> voting-power-for voting-power-against)
+                        (>= (/ (* voting-power-for u100) total-voting-power) u51)))
+      (new-status (if appeal-approved appeal-status-approved appeal-status-rejected))
+    )
+      (map-set appeals
+        { appeal-id: appeal-id }
+        (merge appeal {
+          status: new-status,
+          resolved-block: stacks-block-height
+        })
+      )
+      
+      ;; If appeal is approved, update the dispute status
+      (if appeal-approved
+        (match (map-get? claim-disputes { policy-id: (get policy-id appeal) })
+          dispute (map-set claim-disputes
+                    { policy-id: (get policy-id appeal) }
+                    (merge dispute { status: u3 })) ;; approved
+          true
+        )
+        true
+      )
+      
+      (ok appeal-approved)
+    )
+  )
+)
+
+;; Helper function to list appeals (for checking existence)
+(define-private (list-appeals (appeal-id uint))
+  appeal-id
+)
+
+;; === READ-ONLY APPEAL QUERY FUNCTIONS ===
+
+;; Get claim dispute details
+(define-read-only (get-claim-dispute (policy-id uint))
+  (map-get? claim-disputes { policy-id: policy-id })
+)
+
+;; Get appeal details
+(define-read-only (get-appeal (appeal-id uint))
+  (map-get? appeals { appeal-id: appeal-id })
+)
+
+;; Get user's vote on an appeal
+(define-read-only (get-appeal-vote (appeal-id uint) (voter principal))
+  (map-get? appeal-votes { appeal-id: appeal-id, voter: voter })
+)
+
+;; Check if a claim can be appealed
+(define-read-only (can-appeal-claim (policy-id uint))
+  (match (map-get? claim-disputes { policy-id: policy-id })
+    dispute (and 
+              (is-eq (get status dispute) u2) ;; denied
+              (<= (- stacks-block-height (get dispute-block dispute)) appeal-window-blocks))
+    false
+  )
+)
+
+;; Check if user can vote on appeal
+(define-read-only (can-vote-on-appeal (appeal-id uint) (voter principal))
+  (match (map-get? appeals { appeal-id: appeal-id })
+    appeal (let (
+             (voting-power (calculate-voting-power voter))
+           )
+           (and 
+             (> voting-power u0)
+             (is-eq (get status appeal) appeal-status-pending)
+             (< stacks-block-height (get deadline-block appeal))
+             (is-none (map-get? appeal-votes { appeal-id: appeal-id, voter: voter }))))
+    false
+  )
+)
+
+;; Get appeal voting summary
+(define-read-only (get-appeal-voting-summary (appeal-id uint))
+  (match (map-get? appeals { appeal-id: appeal-id })
+    appeal (some {
+      appeal-id: appeal-id,
+      policy-id: (get policy-id appeal),
+      status: (get status appeal),
+      votes-for: (get votes-for appeal),
+      votes-against: (get votes-against appeal),
+      total-voting-power-for: (get total-voting-power-for appeal),
+      total-voting-power-against: (get total-voting-power-against appeal),
+      deadline-block: (get deadline-block appeal),
+      resolved-block: (get resolved-block appeal)
+    })
+    none
+  )
+)
+
+;; Get user's voting power
+(define-read-only (get-user-voting-power (user principal))
+  (calculate-voting-power user)
+)
+
+;; Check if appeal is ready to be processed
+(define-read-only (can-process-appeal (appeal-id uint))
+  (match (map-get? appeals { appeal-id: appeal-id })
+    appeal (and 
+             (is-eq (get status appeal) appeal-status-pending)
+             (>= stacks-block-height (get deadline-block appeal)))
+    false
+  )
+)
+
+;; Check if there's an existing appeal for a policy
+(define-read-only (has-active-appeal (policy-id uint))
+  ;; This is a simple check - in a production system you might want to iterate through appeals
+  ;; For now, we'll implement a basic version
+  (is-some (map-get? claim-disputes { policy-id: policy-id }))
 )
 
 
